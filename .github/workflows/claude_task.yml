@@ -1,0 +1,930 @@
+name: Claude Code Task
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Task ID from the platform'
+        required: true
+        type: string
+      task_claude_run_id:
+        description: 'Claude Run ID from the platform'
+        required: true
+        type: string
+      instructions:
+        description: 'Instructions for Claude to execute'
+        required: true
+        type: string
+      base_branch:
+        description: 'Base branch to start from'
+        required: true
+        default: 'main'
+        type: string
+      working_branch:
+        description: 'Working branch name for changes'
+        required: true
+        type: string
+      model:
+        description: 'Model to use (haiku, sonnet, opus for Anthropic; gpt-4o-mini, codex for OpenAI)'
+        required: false
+        default: 'sonnet'
+        type: string
+      max_turns:
+        description: 'Maximum turns for the AI agent'
+        required: false
+        default: '30'
+        type: string
+      provider:
+        description: 'AI provider (anthropic or openai)'
+        required: false
+        default: 'anthropic'
+        type: string
+      callback_url:
+        description: 'Base URL for progress callbacks'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RUN_ID: ${{ inputs.task_claude_run_id }}
+  PROGRESS_TOKEN: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}
+
+jobs:
+  claude-code:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Strip trailing slash from callback URL to avoid double slashes in API paths
+      CALLBACK_URL: ${{ inputs.callback_url }}
+
+    steps:
+      - name: Normalize callback URL
+        id: normalize
+        run: |
+          CALLBACK_BASE="${{ inputs.callback_url }}"
+          CALLBACK_BASE="${CALLBACK_BASE%/}"
+          echo "CALLBACK_URL=${CALLBACK_BASE}" >> $GITHUB_ENV
+          echo "Callback URL normalized to: ${CALLBACK_BASE}"
+
+      - name: Report Planning Started
+        if: ${{ inputs.callback_url != '' }}
+        run: |
+          PROVIDER="${{ inputs.provider }}"
+          AGENT_NAME="Claude Code"
+          if [ "$PROVIDER" = "openai" ]; then
+            AGENT_NAME="Codex"
+          fi
+          echo "Sending planning status to: ${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress"
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress" \
+            -H "Content-Type: application/json" \
+            -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+            -d "{
+              \"status\": \"running\",
+              \"plan_started\": true,
+              \"plan\": \"Initializing ${AGENT_NAME}... Analyzing task and codebase...\"
+            }") || true
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "Response code: $HTTP_CODE"
+          echo "Response body: $BODY"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+          # Use REPO_PAT if available (allows workflow file modifications), otherwise fall back to GITHUB_TOKEN
+          token: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "Claude Code"
+          git config user.email "claude@autom8tion.com"
+
+      - name: Create working branch
+        run: git checkout -b ${{ inputs.working_branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache AI CLI
+        uses: actions/cache@v4
+        id: cli-cache
+        with:
+          path: ~/.npm
+          key: ai-cli-${{ inputs.provider }}-${{ runner.os }}
+
+      - name: Install AI CLI
+        run: |
+          if [ "${{ inputs.provider }}" = "openai" ]; then
+            echo "Installing OpenAI Codex CLI..."
+            npm install -g @openai/codex
+          else
+            echo "Installing Claude Code CLI..."
+            npm install -g @anthropic-ai/claude-code
+          fi
+
+      - name: Report Setup Complete
+        if: ${{ inputs.callback_url != '' }}
+        run: |
+          PROVIDER="${{ inputs.provider }}"
+          AGENT_NAME="Claude"
+          if [ "$PROVIDER" = "openai" ]; then
+            AGENT_NAME="Codex"
+          fi
+          curl -s -X POST "${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress" \
+            -H "Content-Type: application/json" \
+            -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+            -d "{
+              \"plan\": \"Environment ready. ${AGENT_NAME} is analyzing the task and implementing changes...\"
+            }" || true
+
+      - name: Set model name
+        id: model
+        run: |
+          MODEL_INPUT="${{ inputs.model }}"
+          PROVIDER="${{ inputs.provider }}"
+
+          if [ "$PROVIDER" = "openai" ]; then
+            case "$MODEL_INPUT" in
+              gpt-4o-mini)
+                echo "model_name=gpt-4o-mini" >> $GITHUB_OUTPUT
+                ;;
+              gpt-4o)
+                echo "model_name=gpt-4o" >> $GITHUB_OUTPUT
+                ;;
+              o3-mini)
+                echo "model_name=o3-mini" >> $GITHUB_OUTPUT
+                ;;
+              *)
+                # Default to codex (GPT-5.3 Codex)
+                echo "model_name=codex" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          else
+            case "$MODEL_INPUT" in
+              haiku)
+                echo "model_name=claude-haiku-4-5-20251001" >> $GITHUB_OUTPUT
+                ;;
+              opus)
+                echo "model_name=claude-opus-4-8" >> $GITHUB_OUTPUT
+                ;;
+              *)
+                echo "model_name=claude-sonnet-4-6" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          fi
+          echo "Using provider: $PROVIDER, model: $(cat $GITHUB_OUTPUT | grep model_name)"
+
+      - name: Write prompt to file
+        env:
+          TASK_INSTRUCTIONS: ${{ inputs.instructions }}
+          TASK_ID: ${{ inputs.task_id }}
+          WORKING_BRANCH: ${{ inputs.working_branch }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          RUN_ID: ${{ inputs.task_claude_run_id }}
+          PROGRESS_TOKEN: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}
+        run: |
+          # Write prompt to file using echo to avoid heredoc indentation issues
+          echo "## Task Instructions" > /tmp/claude_prompt.txt
+          echo "$TASK_INSTRUCTIONS" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+
+          # Include CLAUDE.md project context if it exists
+          if [ -f "CLAUDE.md" ]; then
+            echo "## Project Context (from CLAUDE.md)" >> /tmp/claude_prompt.txt
+            echo "IMPORTANT: Follow these project-specific instructions:" >> /tmp/claude_prompt.txt
+            echo "" >> /tmp/claude_prompt.txt
+            cat CLAUDE.md >> /tmp/claude_prompt.txt
+            echo "" >> /tmp/claude_prompt.txt
+            echo "---" >> /tmp/claude_prompt.txt
+            echo "" >> /tmp/claude_prompt.txt
+          fi
+
+          echo "## Task Context" >> /tmp/claude_prompt.txt
+          echo "- Task ID: $TASK_ID" >> /tmp/claude_prompt.txt
+          echo "- Branch: $WORKING_BRANCH" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+
+          echo "## IMPORTANT: Interpret and Implement" >> /tmp/claude_prompt.txt
+          echo "Users give simple instructions. Your job is to figure out HOW to implement them:" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "1. READ the CLAUDE.md above to understand the project structure" >> /tmp/claude_prompt.txt
+          echo "2. SEARCH for existing related files (use Glob/Grep to find controllers, views, etc.)" >> /tmp/claude_prompt.txt
+          echo "3. UNDERSTAND the existing patterns before writing code" >> /tmp/claude_prompt.txt
+          echo "4. IMPLEMENT the feature by editing existing files - follow existing conventions" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "Example: If user says 'get onboarding working', you should:" >> /tmp/claude_prompt.txt
+          echo "- Search for existing onboarding files (Glob '**/onboarding*', '**/setup*')" >> /tmp/claude_prompt.txt
+          echo "- Read the existing controller/views to understand current implementation" >> /tmp/claude_prompt.txt
+          echo "- Edit those files to complete the feature - don't create new test files" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "RULES:" >> /tmp/claude_prompt.txt
+          echo "- Do NOT create test_*.php or debug files - implement the REAL feature" >> /tmp/claude_prompt.txt
+          echo "- Edit existing files rather than creating new ones" >> /tmp/claude_prompt.txt
+          echo "- Planning without implementation = TASK FAILURE" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+
+          echo "## Report Your Progress" >> /tmp/claude_prompt.txt
+          echo "FIRST, report your plan with subtasks, then update as you complete each:" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "1. Report your plan (do this ONCE at the start):" >> /tmp/claude_prompt.txt
+          echo "curl -s -X POST '$CALLBACK_URL/api/claude-runs/$RUN_ID/progress' -H 'Content-Type: application/json' -H 'X-Progress-Token: $PROGRESS_TOKEN' -d '{\"subtasks\": [{\"id\": \"1\", \"title\": \"First step\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"title\": \"Second step\", \"status\": \"pending\"}], \"current_subtask_id\": \"1\"}'" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "2. As you complete each subtask, update status:" >> /tmp/claude_prompt.txt
+          echo "curl -s -X POST '$CALLBACK_URL/api/claude-runs/$RUN_ID/progress' -H 'Content-Type: application/json' -H 'X-Progress-Token: $PROGRESS_TOKEN' -d '{\"subtask_status\": {\"1\": \"completed\", \"2\": \"in_progress\"}, \"current_subtask_id\": \"2\"}'" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "## Guidelines" >> /tmp/claude_prompt.txt
+          echo "- Use Edit/Write tools to modify files" >> /tmp/claude_prompt.txt
+          echo "- Implement autonomously - do NOT ask questions" >> /tmp/claude_prompt.txt
+          echo "- Follow existing code patterns in the codebase" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "## REQUIRED: Report Testing Steps" >> /tmp/claude_prompt.txt
+          echo "After completing ALL your changes, you MUST report testing steps." >> /tmp/claude_prompt.txt
+          echo "These help the user verify your work. Send a final progress report with testing_steps:" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "curl -s -X POST '$CALLBACK_URL/api/claude-runs/$RUN_ID/progress' -H 'Content-Type: application/json' -H 'X-Progress-Token: $PROGRESS_TOKEN' -d '{\"testing_steps\": [{\"title\": \"Step description\", \"detail\": \"How to verify this step\"}]}'" >> /tmp/claude_prompt.txt
+          echo "" >> /tmp/claude_prompt.txt
+          echo "Each step should be a concrete action the user can take to verify the changes work." >> /tmp/claude_prompt.txt
+          echo "Include 3-8 steps covering: visual checks, functionality tests, edge cases, and navigation." >> /tmp/claude_prompt.txt
+          echo "=== Prompt written to file ($(wc -c < /tmp/claude_prompt.txt) bytes) ==="
+
+      - name: Run AI Agent
+        id: claude
+        timeout-minutes: 10
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Run AI agent with streaming to file so we can monitor progress
+          set +e
+
+          PROVIDER="${{ inputs.provider }}"
+          AGENT_NAME="Claude"
+          if [ "$PROVIDER" = "openai" ]; then
+            AGENT_NAME="Codex"
+          fi
+
+          # Debug: Show callback URL configuration
+          echo "=== Progress Monitoring Configuration ==="
+          echo "Provider: $PROVIDER ($AGENT_NAME)"
+          echo "CALLBACK_URL: ${CALLBACK_URL:-(not set)}"
+          echo "PROGRESS_TOKEN length: ${#PROGRESS_TOKEN}"
+          echo "RUN_ID: ${RUN_ID}"
+
+          # Initialize output file
+          touch /tmp/claude_output.txt
+          touch /tmp/claude_running
+
+          # Background heartbeat - sends status updates every 30 seconds
+          (
+            echo "[Heartbeat] Starting heartbeat loop..."
+            MESSAGES=(
+              "Reading and analyzing the codebase..."
+              "Understanding existing code patterns..."
+              "Planning the implementation approach..."
+              "Making changes to files..."
+              "Reviewing the changes..."
+              "Finalizing implementation..."
+              "Almost done..."
+            )
+            MSG_INDEX=0
+            sleep 20  # Initial delay
+            while [ -f /tmp/claude_running ]; do
+              MSG="${MESSAGES[$MSG_INDEX]}"
+              MSG_INDEX=$(( (MSG_INDEX + 1) % ${#MESSAGES[@]} ))
+
+              echo "[Heartbeat] Sending: $MSG"
+              curl -s -X POST "$CALLBACK_URL/api/claude-runs/$RUN_ID/progress" \
+                -H "Content-Type: application/json" \
+                -H "X-Progress-Token: $PROGRESS_TOKEN" \
+                -d "{\"plan\": \"$MSG\", \"heartbeat\": true}" > /dev/null 2>&1
+
+              sleep 30
+            done
+            echo "[Heartbeat] $AGENT_NAME finished, stopping heartbeat"
+          ) &
+          HEARTBEAT_PID=$!
+
+          # Create wrapper script based on provider
+          echo '#!/bin/bash' > /tmp/run_ai.sh
+          echo 'PROMPT=$(cat /tmp/claude_prompt.txt)' >> /tmp/run_ai.sh
+
+          if [ "$PROVIDER" = "openai" ]; then
+            # Codex CLI: --full-auto for automation, --model for model selection
+            # --json outputs JSONL events to stdout (including turn.completed with token usage)
+            # Write a Python script to parse Codex JSONL output
+            cat > /tmp/parse_codex_output.py << 'PYEOF'
+          import json, sys
+          for line in open("/tmp/codex_json_output.jsonl"):
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  evt = json.loads(line)
+                  if evt.get("type") == "item.completed":
+                      item = evt.get("item", {})
+                      if item.get("item_type") == "assistant_message":
+                          for c in item.get("content", []):
+                              if isinstance(c, dict) and c.get("type") == "text":
+                                  print(c.get("text", ""))
+                  elif evt.get("type") == "turn.completed":
+                      usage = evt.get("usage", {})
+                      if usage:
+                          print("input_tokens: %d" % usage.get("input_tokens", 0))
+                          print("output_tokens: %d" % usage.get("output_tokens", 0))
+              except json.JSONDecodeError:
+                  print(line)
+          PYEOF
+            cat >> /tmp/run_ai.sh << 'SHEOF'
+          codex exec --full-auto --model "$1" --json "$PROMPT" > /tmp/codex_json_output.jsonl 2>&1
+          CODEX_EXIT=$?
+          if [ -f /tmp/codex_json_output.jsonl ]; then
+            python3 /tmp/parse_codex_output.py > /tmp/claude_output.txt 2>&1
+          fi
+          exit $CODEX_EXIT
+          SHEOF
+          else
+            echo 'claude --print --verbose --allowedTools "Read,Grep,Glob,Edit,Write,Bash" --model "$1" --max-turns "$2" "$PROMPT"' >> /tmp/run_ai.sh
+          fi
+          chmod +x /tmp/run_ai.sh
+
+          # Run AI agent - capture output to file
+          if [ "$PROVIDER" = "openai" ]; then
+            # Codex handles its own output via the wrapper script
+            /tmp/run_ai.sh '${{ steps.model.outputs.model_name }}' '${{ inputs.max_turns }}'
+            EXIT_CODE=$?
+            # Also dump the raw JSONL for debugging
+            if [ -f /tmp/codex_json_output.jsonl ]; then
+              echo "=== Raw Codex JSONL output (last 50 lines) ==="
+              tail -50 /tmp/codex_json_output.jsonl
+            fi
+          else
+            /tmp/run_ai.sh '${{ steps.model.outputs.model_name }}' '${{ inputs.max_turns }}' 2>&1 | tee /tmp/claude_output.txt
+            EXIT_CODE=${PIPESTATUS[0]}
+          fi
+
+          # Stop heartbeat by removing marker file
+          rm -f /tmp/claude_running
+          sleep 2
+          kill $HEARTBEAT_PID 2>/dev/null || true
+
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+
+      - name: Report Claude Complete
+        if: ${{ inputs.callback_url != '' }}
+        run: |
+          # Capture Claude's actual output immediately after it finishes
+          if [ -f /tmp/claude_output.txt ]; then
+            FILE_SIZE=$(wc -c < /tmp/claude_output.txt)
+            echo "Output file size: $FILE_SIZE bytes"
+
+            # Write a small python script to build JSON safely
+            # This avoids bash string interpolation corrupting $variables and `backticks`
+            cat > /tmp/build_payload.py << 'PYEOF'
+          import sys, json, re
+          with open("/tmp/claude_output.txt", "rb") as f:
+              f.seek(0, 2)
+              size = f.tell()
+              start = max(0, size - 2500)
+              f.seek(start)
+              raw = f.read().decode("utf-8", errors="replace")
+          raw = raw[-2000:]
+          # If output contains "Reached max turns" but there is substantial output,
+          # strip the max turns line to avoid confusing the UI (the error check step
+          # will handle reporting max turns properly if needed)
+          has_max_turns = "Reached max turns" in raw or "max turns" in raw.lower()
+          if has_max_turns and len(raw) > 200:
+              raw = re.sub(r'(?m)^.*[Rr]eached max turns.*$\n?', '', raw).strip()
+              if len(raw) > 50:
+                  raw = raw + "\n\n(Note: Agent used all available turns but made progress on the task.)"
+          if len(raw) > 50:
+              payload = json.dumps({"plan": raw})
+              with open("/tmp/claude_payload.json", "w") as out:
+                  out.write(payload)
+              print("Payload written: %d chars" % len(raw))
+          elif len(raw.strip()) > 0:
+              # Short output (e.g. max turns error) - still send it so the UI
+              # doesn't stay stuck on a heartbeat message
+              plan_text = "Agent finished with limited output: " + raw.strip()
+              payload = json.dumps({"plan": plan_text})
+              with open("/tmp/claude_payload.json", "w") as out:
+                  out.write(payload)
+              print("Short output sent: %d chars" % len(raw))
+          else:
+              print("Output empty - skipping")
+          PYEOF
+            python3 /tmp/build_payload.py 2>/dev/null || echo "Failed to build payload"
+
+            # Send using --data-binary @file to avoid ANY bash string expansion
+            if [ -f /tmp/claude_payload.json ]; then
+              echo "Sending Claude output to callback"
+              RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress" \
+                -H "Content-Type: application/json" \
+                -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+                --data-binary @/tmp/claude_payload.json) || true
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              echo "Callback response code: $HTTP_CODE"
+            else
+              echo "No payload file generated - skipping output callback"
+            fi
+          else
+            echo "No Claude output file found"
+          fi
+
+      - name: Report Token Usage
+        if: ${{ inputs.callback_url != '' }}
+        run: |
+          PROVIDER="${{ inputs.provider }}"
+          echo "=== Extracting token usage from $PROVIDER output ==="
+          INPUT_TOKENS=0
+          OUTPUT_TOKENS=0
+
+          # For Codex with --json: parse turn.completed events from JSONL
+          if [ "$PROVIDER" = "openai" ] && [ -f /tmp/codex_json_output.jsonl ]; then
+            echo "Parsing Codex JSONL output for token usage..."
+            cat > /tmp/parse_codex_tokens.py << 'PYEOF'
+          import json, sys
+          total_input = 0
+          total_output = 0
+          for line in open('/tmp/codex_json_output.jsonl'):
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  evt = json.loads(line)
+                  if evt.get('type') == 'turn.completed':
+                      usage = evt.get('usage', {})
+                      total_input += usage.get('input_tokens', 0)
+                      total_output += usage.get('output_tokens', 0)
+              except json.JSONDecodeError:
+                  pass
+          print('%d %d' % (total_input, total_output))
+          PYEOF
+            USAGE=$(python3 /tmp/parse_codex_tokens.py 2>/dev/null || echo "0 0")
+            INPUT_TOKENS=$(echo "$USAGE" | awk '{print $1}')
+            OUTPUT_TOKENS=$(echo "$USAGE" | awk '{print $2}')
+            echo "Codex JSONL tokens - Input: $INPUT_TOKENS, Output: $OUTPUT_TOKENS"
+          fi
+
+          # For Claude or as fallback: parse from text output
+          if [ "$INPUT_TOKENS" = "0" ] && [ "$OUTPUT_TOKENS" = "0" ] && [ -f /tmp/claude_output.txt ]; then
+            echo "Parsing text output for token usage..."
+            # Debug: Show last 50 lines where token info usually appears
+            tail -50 /tmp/claude_output.txt || true
+            echo "---"
+
+            # Format 1: "X input tokens" or "X,XXX input tokens"
+            INPUT_TOKENS=$(grep -oiE '([0-9,]+)\s*input\s*tokens' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            OUTPUT_TOKENS=$(grep -oiE '([0-9,]+)\s*output\s*tokens' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+
+            # Format 2: "input: X" or "input tokens: X"
+            if [ "$INPUT_TOKENS" = "0" ]; then
+              INPUT_TOKENS=$(grep -oiE 'input[^0-9]*:?\s*([0-9,]+)' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            fi
+            if [ "$OUTPUT_TOKENS" = "0" ]; then
+              OUTPUT_TOKENS=$(grep -oiE 'output[^0-9]*:?\s*([0-9,]+)' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            fi
+
+            # Format 3: JSON "input_tokens": X (from extracted Codex output or Claude verbose)
+            if [ "$INPUT_TOKENS" = "0" ]; then
+              INPUT_TOKENS=$(grep -oE '"input_tokens":\s*[0-9]+' /tmp/claude_output.txt | grep -oE '[0-9]+' | tail -1 || echo "0")
+            fi
+            if [ "$OUTPUT_TOKENS" = "0" ]; then
+              OUTPUT_TOKENS=$(grep -oE '"output_tokens":\s*[0-9]+' /tmp/claude_output.txt | grep -oE '[0-9]+' | tail -1 || echo "0")
+            fi
+
+            # Format 4: "input_tokens: X" (from Codex extracted text)
+            if [ "$INPUT_TOKENS" = "0" ]; then
+              INPUT_TOKENS=$(grep -oiE 'input_tokens:\s*([0-9,]+)' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            fi
+            if [ "$OUTPUT_TOKENS" = "0" ]; then
+              OUTPUT_TOKENS=$(grep -oiE 'output_tokens:\s*([0-9,]+)' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            fi
+
+            # Format 5: Cost summary like "(12,345 input, 1,234 output)"
+            if [ "$INPUT_TOKENS" = "0" ]; then
+              INPUT_TOKENS=$(grep -oiE '\(([0-9,]+)\s*input' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            fi
+            if [ "$OUTPUT_TOKENS" = "0" ]; then
+              OUTPUT_TOKENS=$(grep -oiE '([0-9,]+)\s*output\)' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+            fi
+
+            # Format 6: Total tokens line like "Total: X tokens"
+            if [ "$INPUT_TOKENS" = "0" ] && [ "$OUTPUT_TOKENS" = "0" ]; then
+              TOTAL=$(grep -oiE 'total[^0-9]*([0-9,]+)\s*tokens' /tmp/claude_output.txt | grep -oE '[0-9,]+' | tr -d ',' | tail -1 || echo "0")
+              if [ "$TOTAL" != "0" ]; then
+                INPUT_TOKENS=$((TOTAL * 80 / 100))
+                OUTPUT_TOKENS=$((TOTAL * 20 / 100))
+              fi
+            fi
+          fi
+
+          # Default to 0 if empty
+          INPUT_TOKENS=${INPUT_TOKENS:-0}
+          OUTPUT_TOKENS=${OUTPUT_TOKENS:-0}
+
+          echo "Extracted tokens - Input: $INPUT_TOKENS, Output: $OUTPUT_TOKENS"
+
+          # Only report if we have actual token counts
+          if [ "$INPUT_TOKENS" != "0" ] || [ "$OUTPUT_TOKENS" != "0" ]; then
+            curl -s -X POST "${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress" \
+              -H "Content-Type: application/json" \
+              -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+              -d "{\"input_tokens\": $INPUT_TOKENS, \"output_tokens\": $OUTPUT_TOKENS}" || true
+            echo "Token usage reported"
+          else
+            echo "No token usage found in output - check workflow logs for output format"
+          fi
+
+      - name: Parse and Report Subtasks
+        if: ${{ inputs.callback_url != '' }}
+        run: |
+          # Extract subtasks from Claude's actual output
+          SUBTASKS_JSON=""
+          FOUND_REAL_SUBTASKS="false"
+
+          echo "=== Parsing Claude output for subtasks ==="
+          if [ -f /tmp/claude_output.txt ]; then
+            FILE_SIZE=$(wc -c < /tmp/claude_output.txt)
+            echo "Output file size: $FILE_SIZE bytes"
+
+            # Try to extract plan section with markers
+            PLAN_SECTION=$(sed -n '/==PLAN_START==/,/==PLAN_END==/p' /tmp/claude_output.txt 2>/dev/null || echo "")
+
+            if [ -n "$PLAN_SECTION" ]; then
+              echo "Found plan section with markers"
+              # Extract SUBTASK lines
+              SUBTASK_LINES=$(echo "$PLAN_SECTION" | grep -E "^SUBTASK:" | sed 's/^SUBTASK: //' || echo "")
+
+              if [ -n "$SUBTASK_LINES" ]; then
+                SUBTASKS_JSON="["
+                ID=1
+                while IFS= read -r line; do
+                  if [ -n "$line" ]; then
+                    ESCAPED_LINE=$(echo "$line" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr -d '\n\r')
+                    if [ $ID -gt 1 ]; then
+                      SUBTASKS_JSON="$SUBTASKS_JSON,"
+                    fi
+                    SUBTASKS_JSON="$SUBTASKS_JSON{\"id\":\"$ID\",\"title\":\"$ESCAPED_LINE\",\"status\":\"completed\"}"
+                    ID=$((ID + 1))
+                  fi
+                done <<< "$SUBTASK_LINES"
+                SUBTASKS_JSON="$SUBTASKS_JSON]"
+                FOUND_REAL_SUBTASKS="true"
+                echo "Found $((ID-1)) subtasks from markers"
+              fi
+            fi
+
+            # Fallback: Try to find bullet points or numbered lists that look like a plan
+            if [ "$FOUND_REAL_SUBTASKS" = "false" ]; then
+              # Look for lines that start with "I'll" or "Let me" followed by action verbs
+              ACTION_LINES=$(grep -oE "(I'll|Let me|First,|Next,|Then,|Finally,)[^.]*\." /tmp/claude_output.txt | head -6 || echo "")
+              if [ -n "$ACTION_LINES" ]; then
+                SUBTASKS_JSON="["
+                ID=1
+                while IFS= read -r line; do
+                  if [ -n "$line" ] && [ ${#line} -gt 10 ] && [ ${#line} -lt 150 ]; then
+                    ESCAPED_LINE=$(echo "$line" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr -d '\n\r')
+                    if [ $ID -gt 1 ]; then
+                      SUBTASKS_JSON="$SUBTASKS_JSON,"
+                    fi
+                    SUBTASKS_JSON="$SUBTASKS_JSON{\"id\":\"$ID\",\"title\":\"$ESCAPED_LINE\",\"status\":\"completed\"}"
+                    ID=$((ID + 1))
+                  fi
+                done <<< "$ACTION_LINES"
+                if [ $ID -gt 1 ]; then
+                  SUBTASKS_JSON="$SUBTASKS_JSON]"
+                  FOUND_REAL_SUBTASKS="true"
+                  echo "Found $((ID-1)) subtasks from action phrases"
+                else
+                  SUBTASKS_JSON=""
+                fi
+              fi
+            fi
+          else
+            echo "WARNING: /tmp/claude_output.txt does not exist!"
+          fi
+
+          # Fallback: Generate subtasks from git diff when no Claude output captured
+          if [ "$FOUND_REAL_SUBTASKS" = "false" ]; then
+            echo "No subtasks from Claude output, checking git for file changes..."
+
+            # First check uncommitted changes
+            CHANGED_FILES=$(git status --porcelain 2>/dev/null | head -10)
+
+            # If no uncommitted changes, check for already-committed changes (Claude may have committed via Bash)
+            if [ -z "$CHANGED_FILES" ]; then
+              echo "No uncommitted changes, checking for committed changes vs base branch..."
+              CHANGED_FILES=$(git diff --name-status origin/${{ inputs.base_branch }}..HEAD 2>/dev/null | head -10)
+            fi
+
+            if [ -n "$CHANGED_FILES" ]; then
+              SUBTASKS_JSON="["
+              ID=1
+
+              while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                  # Parse git status/diff format: "XY filename" or "X\tfilename"
+                  STATUS_CODE="${line:0:2}"
+                  FILENAME="${line:3}"
+                  # Handle tab-separated format from git diff --name-status
+                  if [[ "$line" == *$'\t'* ]]; then
+                    STATUS_CODE=$(echo "$line" | cut -f1)
+                    FILENAME=$(echo "$line" | cut -f2-)
+                  fi
+
+                  # Determine action based on status code
+                  case "$STATUS_CODE" in
+                    A*|"??"*) ACTION="Created" ;;
+                    M*|" M"*) ACTION="Modified" ;;
+                    D*|" D"*) ACTION="Deleted" ;;
+                    R*) ACTION="Renamed" ;;
+                    *) ACTION="Updated" ;;
+                  esac
+
+                  # Clean up filename (remove any leading space)
+                  FILENAME=$(echo "$FILENAME" | sed 's/^ *//')
+
+                  # Create subtask entry
+                  ESCAPED_TITLE=$(echo "$ACTION $FILENAME" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr -d '\n\r')
+
+                  if [ $ID -gt 1 ]; then
+                    SUBTASKS_JSON="$SUBTASKS_JSON,"
+                  fi
+                  SUBTASKS_JSON="$SUBTASKS_JSON{\"id\":\"$ID\",\"title\":\"$ESCAPED_TITLE\",\"status\":\"completed\"}"
+                  ID=$((ID + 1))
+                fi
+              done <<< "$CHANGED_FILES"
+
+              if [ $ID -gt 1 ]; then
+                SUBTASKS_JSON="$SUBTASKS_JSON]"
+                FOUND_REAL_SUBTASKS="true"
+                echo "Generated $((ID-1)) subtasks from git file changes"
+              fi
+            fi
+          fi
+
+          # Only send subtasks if we found REAL ones (not generics)
+          if [ "$FOUND_REAL_SUBTASKS" = "true" ] && [ -n "$SUBTASKS_JSON" ]; then
+            echo "Sending ${#SUBTASKS_JSON} chars of parsed subtasks"
+            curl -s -X POST "${{ inputs.callback_url }}/api/claude-runs/${{ inputs.task_claude_run_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+              -d "{\"plan_completed\": true, \"subtasks\": $SUBTASKS_JSON}" || true
+          else
+            echo "No subtasks found from Claude output or git changes"
+            # Just mark plan as completed without changing subtasks
+            curl -s -X POST "${{ inputs.callback_url }}/api/claude-runs/${{ inputs.task_claude_run_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+              -d "{\"plan_completed\": true}" || true
+          fi
+
+      - name: Debug Claude Results
+        if: always()
+        run: |
+          echo "=== Claude Exit Code: ${{ steps.claude.outputs.exit_code }} ==="
+          echo ""
+          echo "=== Current Working Directory ==="
+          pwd
+          echo ""
+          echo "=== Git Status ==="
+          git status
+          echo ""
+          echo "=== Git Status Porcelain (uncommitted changes) ==="
+          git status --porcelain || echo "(empty - no uncommitted changes)"
+          echo ""
+          echo "=== Commits on branch vs base (Claude may have committed via Bash) ==="
+          COMMIT_COUNT=$(git rev-list --count origin/${{ inputs.base_branch }}..HEAD 2>/dev/null || echo "0")
+          echo "Commits ahead of origin/${{ inputs.base_branch }}: $COMMIT_COUNT"
+          if [ "$COMMIT_COUNT" -gt 0 ] 2>/dev/null; then
+            git log --oneline origin/${{ inputs.base_branch }}..HEAD 2>/dev/null || true
+            echo ""
+            echo "=== Files changed in commits ==="
+            git diff --name-status origin/${{ inputs.base_branch }}..HEAD 2>/dev/null || true
+          fi
+          echo ""
+          echo "=== Uncommitted Modified/New Files ==="
+          git diff --name-only HEAD 2>/dev/null || echo "(no diff)"
+          git ls-files --others --exclude-standard 2>/dev/null || echo "(no untracked)"
+          echo ""
+          echo "=== Directory Listing (source path) ==="
+          ls -la tss/app/ 2>/dev/null | head -20 || echo "(tss/app not found)"
+
+      - name: Check for changes
+        if: always()
+        id: changes
+        run: |
+          # Check for uncommitted changes (Claude used Edit/Write but didn't commit)
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "has_uncommitted=true" >> $GITHUB_OUTPUT
+            echo "Changes detected (uncommitted files)!"
+          # Check for already-committed changes (Claude used Bash to git commit)
+          elif [ "$(git rev-list --count origin/${{ inputs.base_branch }}..HEAD 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "has_uncommitted=false" >> $GITHUB_OUTPUT
+            COMMIT_COUNT=$(git rev-list --count origin/${{ inputs.base_branch }}..HEAD)
+            echo "Changes detected ($COMMIT_COUNT commit(s) already made by Claude)!"
+            echo "Commits:"
+            git log --oneline origin/${{ inputs.base_branch }}..HEAD
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "has_uncommitted=false" >> $GITHUB_OUTPUT
+            echo "No changes detected - Claude may have failed to write files"
+          fi
+
+      - name: Commit changes
+        if: always() && steps.changes.outputs.has_changes == 'true' && steps.changes.outputs.has_uncommitted == 'true'
+        run: |
+          PROVIDER="${{ inputs.provider }}"
+          AGENT_NAME="Claude Code"
+          if [ "$PROVIDER" = "openai" ]; then
+            AGENT_NAME="Codex"
+          fi
+          git add -A
+          git commit -m "${AGENT_NAME}: Task #${{ inputs.task_id }}
+
+          Automated changes by ${AGENT_NAME}.
+          Run ID: ${{ inputs.task_claude_run_id }}"
+
+      - name: Rebase onto latest main
+        if: always() && steps.changes.outputs.has_changes == 'true'
+        id: rebase
+        run: |
+          echo "=== Rebasing onto latest ${{ inputs.base_branch }} to prevent overwriting other tasks ==="
+
+          # Fetch the latest base branch
+          git fetch origin ${{ inputs.base_branch }}
+
+          # Check if there are new commits on base branch
+          BEHIND_COUNT=$(git rev-list --count HEAD..origin/${{ inputs.base_branch }})
+          echo "Commits behind ${{ inputs.base_branch }}: $BEHIND_COUNT"
+
+          if [ "$BEHIND_COUNT" -gt 0 ]; then
+            echo "Base branch has new commits - rebasing..."
+
+            # Attempt rebase
+            if git rebase origin/${{ inputs.base_branch }}; then
+              echo "rebase_success=true" >> $GITHUB_OUTPUT
+              echo "Rebase successful! This task now includes all latest changes."
+            else
+              echo "rebase_success=false" >> $GITHUB_OUTPUT
+              echo "::error::Rebase failed due to conflicts. This task conflicts with recent changes."
+              # Abort the rebase and fail
+              git rebase --abort
+              exit 1
+            fi
+          else
+            echo "rebase_success=true" >> $GITHUB_OUTPUT
+            echo "Already up to date with ${{ inputs.base_branch }}"
+          fi
+
+      - name: Push working branch
+        if: always() && steps.changes.outputs.has_changes == 'true' && steps.rebase.outputs.rebase_success == 'true'
+        id: push
+        run: |
+          # Force push since we may have rebased
+          git push --force-with-lease origin ${{ inputs.working_branch }}
+          echo "HEAD_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Report Completed
+        if: ${{ always() && inputs.callback_url != '' && steps.changes.outputs.has_changes == 'true' && steps.rebase.outputs.rebase_success == 'true' }}
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "Sending completion status to: ${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress"
+          echo "Head SHA: ${HEAD_SHA}"
+
+          # Build a completion summary from the changed files
+          CHANGED_FILES=$(git diff --name-only HEAD~1 2>/dev/null | head -10)
+          FILE_COUNT=$(echo "$CHANGED_FILES" | grep -c . 2>/dev/null || echo "0")
+          FILE_LIST=$(echo "$CHANGED_FILES" | sed 's/^/  - /' | head -5)
+          COMPLETION_PLAN="Task completed. ${FILE_COUNT} file(s) modified and pushed to branch.\n\nFiles changed:\n${FILE_LIST}"
+
+          # Check if max turns was reached despite making changes
+          HIT_MAX_TURNS="false"
+          if [ -f /tmp/claude_output.txt ] && grep -q "Reached max turns" /tmp/claude_output.txt; then
+            HIT_MAX_TURNS="true"
+            COMPLETION_PLAN="${COMPLETION_PLAN}\n\n(Note: The agent used all available turns but successfully completed changes.)"
+          fi
+
+          # Use Python to build JSON safely (avoids bash string issues)
+          cat > /tmp/build_completion.py << 'PYEOF'
+          import json, sys, os
+          plan = os.environ.get('COMPLETION_PLAN', 'Task completed. Changes pushed to branch.')
+          head_sha = os.environ.get('HEAD_SHA', '')
+          payload = {
+              "status": "completed",
+              "plan_completed": True,
+              "head_sha": head_sha,
+              "plan": plan
+          }
+          with open("/tmp/completion_payload.json", "w") as f:
+              json.dump(payload, f)
+          print("Payload written: %d chars" % len(plan))
+          PYEOF
+          COMPLETION_PLAN="$COMPLETION_PLAN" HEAD_SHA="$HEAD_SHA" python3 /tmp/build_completion.py
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${CALLBACK_URL}/api/claude-runs/${RUN_ID}/progress" \
+            -H "Content-Type: application/json" \
+            -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+            --data-binary @/tmp/completion_payload.json) || true
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "Response code: $HTTP_CODE"
+          echo "Response body: $BODY"
+          echo "Task completed with changes pushed to branch"
+
+      - name: Report Rebase Failed
+        if: ${{ always() && inputs.callback_url != '' && steps.changes.outputs.has_changes == 'true' && steps.rebase.outputs.rebase_success == 'false' }}
+        run: |
+          curl -s -X POST "${{ inputs.callback_url }}/api/claude-runs/${{ inputs.task_claude_run_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+            -d '{
+              "plan": "Task completed but could not merge due to conflicts with recent changes. Please retry this task.",
+              "plan_completed": true
+            }' || true
+          echo "::warning::Rebase failed - conflicts with recent changes on base branch"
+
+      - name: Report No Changes
+        if: ${{ always() && inputs.callback_url != '' && steps.changes.outputs.has_changes == 'false' }}
+        run: |
+          EXIT_CODE="${{ steps.claude.outputs.exit_code }}"
+          HAS_ERROR="false"
+          ERROR_MSG=""
+
+          # Check for known error patterns in output (Claude CLI may return 0 even on errors)
+          if [ -f /tmp/claude_output.txt ]; then
+            # Check for max turns error
+            if grep -q "Reached max turns" /tmp/claude_output.txt; then
+              HAS_ERROR="true"
+              ERROR_MSG="Claude reached the maximum turns limit (${{ inputs.max_turns }}) without completing the task. The task may be too complex - try breaking it into smaller steps or increasing the max turns."
+            # Check for other common errors
+            elif grep -qi "error:\|fatal:\|exception:\|failed to" /tmp/claude_output.txt; then
+              HAS_ERROR="true"
+              ERROR_DETAIL=$(grep -i "error:\|fatal:\|exception:\|failed to" /tmp/claude_output.txt | tail -3 | tr '\n' ' ' | sed 's/"/\\"/g' | head -c 300)
+              ERROR_MSG="Claude encountered an error: $ERROR_DETAIL"
+            fi
+          fi
+
+          # Also check exit code
+          if [ "$EXIT_CODE" != "0" ] && [ -n "$EXIT_CODE" ] && [ "$HAS_ERROR" = "false" ]; then
+            HAS_ERROR="true"
+            ERROR_MSG="Claude exited with code $EXIT_CODE. Check the workflow logs for details."
+          fi
+
+          if [ "$HAS_ERROR" = "true" ]; then
+            # Claude had an error - report it
+            echo "Detected error: $ERROR_MSG"
+
+            curl -s -X POST "${{ inputs.callback_url }}/api/claude-runs/${{ inputs.task_claude_run_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+              -d "{
+                \"status\": \"failed\",
+                \"plan\": \"$ERROR_MSG\",
+                \"plan_completed\": true,
+                \"subtasks\": [
+                  {\"id\": \"1\", \"title\": \"Setting up environment\", \"status\": \"completed\"},
+                  {\"id\": \"2\", \"title\": \"Analyzing task requirements\", \"status\": \"completed\"},
+                  {\"id\": \"3\", \"title\": \"Task execution failed\", \"status\": \"failed\"},
+                  {\"id\": \"4\", \"title\": \"Review error and retry\", \"status\": \"pending\"}
+                ],
+                \"current_subtask_id\": null
+              }" || true
+            echo "::error::Claude task failed: $ERROR_MSG"
+          else
+            # Claude succeeded but no changes - this is a valid outcome
+            # Set status to completed_no_changes so the UI shows the pipeline as done
+            curl -s -X POST "${{ inputs.callback_url }}/api/claude-runs/${{ inputs.task_claude_run_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "X-Progress-Token: ${{ secrets.CLAUDE_PROGRESS_TOKEN }}" \
+              -d '{
+                "status": "completed_no_changes",
+                "plan": "Analyzed the codebase and determined no file changes were necessary for this task.",
+                "plan_completed": true,
+                "subtasks": [
+                  {"id": "1", "title": "Setting up environment", "status": "completed"},
+                  {"id": "2", "title": "Analyzing task requirements", "status": "completed"},
+                  {"id": "3", "title": "No changes needed", "status": "completed"},
+                  {"id": "4", "title": "Task complete", "status": "completed"}
+                ],
+                "current_subtask_id": null
+              }' || true
+            echo "::warning::No changes made for this task."
+          fi
+
+      - name: Output results
+        run: |
+          echo "## Claude Code Task Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Task ID:** ${{ inputs.task_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ inputs.working_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes:** ${{ steps.changes.outputs.has_changes }}" >> $GITHUB_STEP_SUMMARY
