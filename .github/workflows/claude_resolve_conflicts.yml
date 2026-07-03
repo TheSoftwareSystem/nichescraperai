@@ -1,0 +1,113 @@
+name: Claude Resolve Conflicts
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: 'The PR head branch with conflicts'
+        required: true
+        type: string
+      base_branch:
+        description: 'The base branch to merge from (e.g. main)'
+        required: true
+        default: 'main'
+        type: string
+      pr_number:
+        description: 'PR number for commit message'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-conflicts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "Claude Code"
+          git config user.email "claude@autom8tion.com"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Claude Code CLI
+        uses: actions/cache@v4
+        id: claude-cache
+        with:
+          path: ~/.npm
+          key: claude-code-cli-${{ runner.os }}
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Write conflict resolution prompt
+        run: |
+          cat > /tmp/claude_prompt.txt << 'PROMPT_EOF'
+          You are resolving merge conflicts on a pull request.
+
+          ## Steps
+          1. Run: git fetch origin ${{ inputs.base_branch }}
+          2. Run: git merge origin/${{ inputs.base_branch }}
+          3. If there are merge conflicts, resolve ALL of them:
+             - Read each conflicted file to understand both sides
+             - Edit the files to produce the correct merged result
+             - Remove all conflict markers (<<<<<<, ======, >>>>>>>)
+          4. Stage resolved files with git add and complete the merge commit
+          5. If the merge completed cleanly with no conflicts, that's fine
+          6. Push the result: git push origin ${{ inputs.pr_branch }}
+
+          ## Rules
+          - Preserve changes from BOTH branches when possible
+          - When sides conflict on the same logic, prefer HEAD (PR branch) since it's the newer feature work, but incorporate non-conflicting changes from the base branch
+          - Do NOT delete code that either branch intentionally added
+          - Do NOT add features, refactoring, or comments beyond resolving conflicts
+          - Verify no conflict markers remain in any file
+          - Your ONLY job is to resolve conflicts and push — do NOT modify other files
+          PROMPT_EOF
+
+      - name: Run Claude Code
+        id: claude
+        timeout-minutes: 8
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          PROMPT=$(cat /tmp/claude_prompt.txt)
+          claude --print --verbose --allowedTools "Read,Grep,Glob,Edit,Write,Bash" --model "claude-sonnet-4-6" --max-turns 15 "$PROMPT" 2>&1 | tee /tmp/claude_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+
+      - name: Verify resolution
+        run: |
+          echo "=== Git Status ==="
+          git status
+          echo ""
+          echo "=== Checking for remaining conflict markers ==="
+          if grep -rn "<<<<<<" --include="*.php" --include="*.js" --include="*.ts" --include="*.css" --include="*.html" --include="*.json" --include="*.yml" --include="*.yaml" . 2>/dev/null; then
+            echo "::error::Conflict markers still present in files!"
+            exit 1
+          else
+            echo "No conflict markers found — resolution looks clean"
+          fi
+
+      - name: Output results
+        run: |
+          echo "## Conflict Resolution Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR Branch:** ${{ inputs.pr_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Base Branch:** ${{ inputs.base_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR:** #${{ inputs.pr_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Exit Code:** ${{ steps.claude.outputs.exit_code }}" >> $GITHUB_STEP_SUMMARY
