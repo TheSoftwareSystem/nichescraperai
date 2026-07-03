@@ -1,0 +1,22 @@
+{
+    "name": "NicheScraper AI",
+    "slug": "nichescraper-ai",
+    "description": "AI-generated NicheScraper AI application",
+    "version": "1.0.0",
+    "category": "saas",
+    "database": {
+        "required": true,
+        "schema_file": "schema.sql",
+        "tables": [
+            "users",
+            "user_refresh_tokens"
+        ]
+    },
+    "config_file": "config.php",
+    "default_credentials": {
+        "email": "admin",
+        "password": "admin123"
+    },
+    "generated_by": "ai_code_builder",
+    "generated_at": "2026-07-03 09:10:22"
+}

@@ -1,0 +1,50 @@
+DirectoryIndex index.php index.html
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Handle directory root without trailing slash (required when DirectorySlash Off is set upstream)
+    RewriteRule ^$ index.php [L]
+
+    RewriteRule ^data/ - [F,L]
+    RewriteRule ^includes/ - [F,L]
+
+    # Serve index.php for subdirectory requests
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteCond %{REQUEST_FILENAME}/index.php -f
+    RewriteRule ^(.+?)/?$ $1/index.php [L]
+
+    # Route non-file requests through index.php
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ index.php?route=$1 [QSA,L]
+</IfModule>
+
+Options -Indexes
+
+# Explicitly allow access to this directory (required for subdirectory deployments)
+<IfModule mod_authz_core.c>
+    Require all granted
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Allow from all
+</IfModule>
+
+# Protect sensitive files
+<FilesMatch "^(config\.php|\.htaccess|\.user\.ini)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Security headers
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-XSS-Protection "1; mode=block"
+</IfModule>
